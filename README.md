@@ -8,6 +8,8 @@ working proofs-of-concept of:
 - HS/RS algorithm-confusion attacks against a misconfigured `IssuerSigningKeyResolver`
 - Forwarded-header spoofing attacks against misconfigured reverse-proxy setups
   (IP allowlist bypass, scheme spoofing, host spoofing)
+- Middleware auto-injection probes that document how `WebApplicationBuilder`
+  defends against the historical "I forgot `app.UseAuthorization()`" footgun
 
 ## What this is
 
@@ -36,7 +38,35 @@ The lab is split into two project pairs, one per attack surface.
 | --- | --- |
 | `ForwardedHeadersTests` | Default config refuses spoofed `X-Forwarded-*` headers from non-loopback sources, but honors them from loopback (the dev-time trap). The "TrustAll" anti-pattern (cleared `KnownProxies`/`KnownIPNetworks`) re-enables full spoofing of `RemoteIpAddress`, `Scheme`, `Host` — including bypassing an `IsLoopback`-based IP allowlist by spoofing `X-Forwarded-For: 127.0.0.1` |
 
-37 / 37 tests pass on .NET 10.0.102.
+**`Pipeline.Api` + `Pipeline.Tests` — Middleware auto-injection (6 tests)**
+
+| Test class | What it asserts |
+| --- | --- |
+| `PipelineOrderingTests` | `WebApplicationBuilder.Build()` auto-injects `UseAuthentication` and `UseAuthorization` when their services are registered, even if the user code never calls them explicitly. Standard config: `[Authorize]` correctly enforced (anonymous → 401, authenticated → 200). When `AddAuthorization` is registered without `AddAuthentication`, the framework throws a clear `InvalidOperationException` at request time pointing the developer at `AddAuthentication`. When `AddAuthentication` is registered without `AddAuthorization`, the missing-middleware detector in `EndpointMiddleware` throws (500) for endpoints carrying `[Authorize]` metadata |
+
+46 / 46 tests pass on .NET 10.0.102.
+
+## Key finding 3: WebApplication auto-injects auth middleware
+
+The classic ASP.NET footgun — registering `[Authorize]` attributes but
+forgetting `app.UseAuthorization()` — is mitigated for apps using the modern
+`WebApplication` pattern. `WebApplicationBuilder.Build()` calls
+`app.UseAuthentication()` and `app.UseAuthorization()` automatically when
+the corresponding services are registered ([source](https://github.com/dotnet/aspnetcore/blob/main/src/DefaultBuilder/src/WebApplicationBuilder.cs)).
+
+This means:
+
+| Configuration | Outcome |
+| --- | --- |
+| `AddAuthentication` + `AddAuthorization` (standard) | Both middlewares auto-injected. `[Authorize]` enforced correctly. |
+| `AddAuthorization` only (no `AddAuthentication`) | `UseAuthorization` auto-injected. At first request, `AuthorizationMiddleware` throws `InvalidOperationException` because `IAuthenticationService` is missing. The error message points at `AddAuthentication`. |
+| `AddAuthentication` only (no `AddAuthorization`) | `UseAuthentication` auto-injected; `UseAuthorization` is NOT (services missing). The missing-middleware detector in `EndpointMiddleware` throws when an endpoint with `[Authorize]` metadata executes. 500 with a clear error message pointing at `app.UseAuthorization()`. |
+
+The framework's defensive posture here is strong: a misconfiguration produces
+a *loud, immediate* failure with a corrective error message, rather than
+silently accepting unauthenticated requests. This is the *opposite* of the
+historical bug class. Older `Startup.cs`-style apps and apps using a non-
+`WebApplication` host do not benefit from the auto-injection.
 
 ## Key finding 2: Forwarded-header spoofing across config modes
 
@@ -137,6 +167,15 @@ auth-lab/
     Fixtures.cs             LoopbackDefault / PublicDefault / PublicTrustAll
                             / PublicOff fixtures via PostConfigure.
     ForwardedHeadersTests.cs
+  Pipeline.Api/
+    Program.cs              Minimal API: /public, /protected with [Authorize].
+                            Conditionally registers AddAuthentication and/or
+                            AddAuthorization based on config so test fixtures
+                            can probe auto-injection edges.
+  Pipeline.Tests/
+    Fixtures.cs             Standard / NoAuthenticationService /
+                            NoAuthorizationService fixtures via UseSetting.
+    PipelineOrderingTests.cs
 ```
 
 ## Intentional vulnerabilities (do not deploy)
