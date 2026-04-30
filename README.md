@@ -10,9 +10,6 @@ working proofs-of-concept of:
   (IP allowlist bypass, scheme spoofing, host spoofing)
 - Middleware auto-injection probes that document how `WebApplicationBuilder`
   defends against the historical "I forgot `app.UseAuthorization()`" footgun
-- A **decompression bomb** that bypasses `RequestDecompressionMiddleware`'s
-  size cap when `MaxRequestBodySize` is `null` (a real framework bug —
-  C# nullable comparison silently disables the limit)
 
 ## What this is
 
@@ -47,50 +44,7 @@ The lab is split into two project pairs, one per attack surface.
 | --- | --- |
 | `PipelineOrderingTests` | `WebApplicationBuilder.Build()` auto-injects `UseAuthentication` and `UseAuthorization` when their services are registered, even if the user code never calls them explicitly. Standard config: `[Authorize]` correctly enforced (anonymous → 401, authenticated → 200). When `AddAuthorization` is registered without `AddAuthentication`, the framework throws a clear `InvalidOperationException` at request time pointing the developer at `AddAuthentication`. When `AddAuthentication` is registered without `AddAuthorization`, the missing-middleware detector in `EndpointMiddleware` throws (500) for endpoints carrying `[Authorize]` metadata |
 
-**`Decompression.Api` + `Decompression.Tests` — Decompression bomb via null sizeLimit (3 tests)**
-
-| Test class | What it asserts |
-| --- | --- |
-| `DecompressionBombTests` | `RequestDecompressionMiddleware` correctly rejects a gzip bomb with **413** against an endpoint with a real `MaxRequestBodySize`. The same payload silently succeeds with **200** against an endpoint with `[DisableRequestSizeLimit]` because the wrapped `SizeLimitedStream` evaluates `_totalBytesRead > _sizeLimit` as `false` when `_sizeLimit` is `null` (lifted C# nullable comparison). 50 MB of gzip-decompressed body is read with `decompressedBytesRead: 52428800` |
-
-49 / 49 tests pass on .NET 10.0.102.
-
-## Key finding 4: Decompression bomb via null `MaxRequestBodySize`
-
-`Microsoft.AspNetCore.RequestDecompression` middleware wraps the request body
-in a `SizeLimitedStream` parameterised with the endpoint's `MaxRequestBodySize`.
-When that value is `null` (e.g. an endpoint with `[DisableRequestSizeLimit]`,
-or an app that sets `Limits.MaxRequestBodySize = null`), the size check is
-silently bypassed:
-
-```csharp
-// src/Shared/SizeLimitedStream.cs
-if (_totalBytesRead > _sizeLimit)   // _sizeLimit is long?; this is false when null
-{
-    _handleSizeLimit?.Invoke(_sizeLimit.Value);   // never reached
-}
-```
-
-| Endpoint config | 5 MB gzip bomb | 50 MB gzip bomb |
-| --- | --- | --- |
-| `[RequestSizeLimit(1 MB)]` | **413** PayloadTooLarge (correct) | not tested |
-| `[DisableRequestSizeLimit]` | (n/a) | **200** OK, full body read |
-
-The framework defends correctly when a real size limit is configured. It
-silently does not defend when the developer disables that limit — and the
-developer's mental model when writing `[DisableRequestSizeLimit]` is usually
-"I accept arbitrary client uploads", not "I accept arbitrary decompression
-amplification."
-
-**Fix in application code (until the framework adds an independent cap):**
-
-* Do not combine `app.UseRequestDecompression()` with `[DisableRequestSizeLimit]`
-  unless you also wrap your body reads in your own size-limited stream.
-* Or set an explicit `[RequestSizeLimit(N)]` (preferably small, since `N` here
-  is the *decompressed* budget for any compressed-body request).
-
-Tracked upstream: file an issue at `dotnet/aspnetcore` referencing this lab as
-the repro. Replace this line with the issue link once filed.
+46 / 46 tests pass on .NET 10.0.102.
 
 ## Key finding 3: WebApplication auto-injects auth middleware
 
@@ -222,12 +176,6 @@ auth-lab/
     Fixtures.cs             Standard / NoAuthenticationService /
                             NoAuthorizationService fixtures via UseSetting.
     PipelineOrderingTests.cs
-  Decompression.Api/
-    Program.cs              Minimal API: /upload-bounded ([RequestSizeLimit(1MB)]),
-                            /upload-unbounded ([DisableRequestSizeLimit]).
-                            Both call Request.Body.CopyToAsync to a MemoryStream.
-  Decompression.Tests/
-    DecompressionBombTests.cs  3 tests demonstrating the null-sizeLimit bypass.
   tools/
     policy-audit.py         Programmatic audit of GitOps/FabricBot
                             resourceManagement.yml across multiple Microsoft
