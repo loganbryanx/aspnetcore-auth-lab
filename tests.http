@@ -1,0 +1,91 @@
+### AuthLab — manual exploration via REST Client (VS Code) or JetBrains HTTP Client.
+### Run AuthLab.Api first:  dotnet run --project AuthLab.Api
+
+@base = https://localhost:7099
+
+# ----------------------------------------------------------------------------
+# Mint tokens via /dev/token
+# ----------------------------------------------------------------------------
+
+### Mint valid token
+GET {{base}}/dev/token?sub=alice
+
+### Mint admin token
+GET {{base}}/dev/token?sub=alice&role=admin
+
+### Mint expired-by-1-hour token (past default 5-min ClockSkew, will be rejected)
+GET {{base}}/dev/token?sub=alice&exp=-3600
+
+### Mint slightly expired token (within ClockSkew, will still be accepted -- JWT-V03)
+GET {{base}}/dev/token?sub=alice&exp=-60
+
+### Mint wrong-issuer token
+GET {{base}}/dev/token?sub=alice&iss=https://attacker.example
+
+### Mint wrong-audience token
+GET {{base}}/dev/token?sub=alice&aud=other-api
+
+### Mint token signed with a different key (signature should fail)
+GET {{base}}/dev/token?sub=alice&key=totally-different-key-of-sufficient-length-1234567890
+
+### Mint token with future nbf
+GET {{base}}/dev/token?sub=alice&nbf=3600
+
+# ----------------------------------------------------------------------------
+# JWT endpoint exercises -- paste a token from above into @jwt
+# ----------------------------------------------------------------------------
+
+@jwt = paste-token-here
+
+### Public endpoint -- always 200
+GET {{base}}/public
+
+### /secure with no token -- expect 401 + WWW-Authenticate: Bearer
+GET {{base}}/secure
+
+### /secure with valid token
+GET {{base}}/secure
+Authorization: Bearer {{jwt}}
+
+### /admin with admin role token
+GET {{base}}/admin
+Authorization: Bearer {{jwt}}
+
+### JWT-V01: alg:none token (signature absent). Expect 401.
+GET {{base}}/secure
+Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vbG9jYWxob3N0OjcwOTkiLCJhdWQiOiJhdXRoLWxhYiIsImV4cCI6OTk5OTk5OTk5OSwicm9sZSI6ImFkbWluIn0.
+
+### JWT-V04: token in query string. Expect 401 (default JwtBearer ignores it).
+GET {{base}}/secure?access_token={{jwt}}
+
+### JWT-V05: lowercase bearer prefix. Expect 200 (RFC 6750 case-insensitive).
+GET {{base}}/secure
+Authorization: bearer {{jwt}}
+
+# ----------------------------------------------------------------------------
+# Cookie auth flow
+# ----------------------------------------------------------------------------
+
+### C-E02: missing cookie -- expect 302 to /cookie/login
+GET {{base}}/cookie/secure
+
+### C-E01: log in (HTTP client will store the cookie)
+POST {{base}}/cookie/login
+Content-Type: application/json
+
+{ "user": "alice" }
+
+### C-E01 cont'd: now access protected page
+GET {{base}}/cookie/secure
+
+### C-V01: open-redirect via ReturnUrl (intentional vuln)
+POST {{base}}/cookie/login
+Content-Type: application/json
+
+{ "user": "alice", "returnUrl": "https://evil.example/" }
+
+### C-V04: CSRF-vulnerable transfer (no antiforgery)
+POST {{base}}/cookie/transfer?amount=100&to=bob
+
+### Logout
+POST {{base}}/cookie/logout
