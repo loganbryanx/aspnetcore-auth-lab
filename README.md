@@ -1,10 +1,13 @@
-# auth-lab
+# aspnetcore-auth-lab
 
 A self-contained ASP.NET Core 10 lab for hands-on security research against
-`JwtBearer` and Cookie authentication. Built to **break assumptions and
-observe what the framework actually does** — including a working
-proof-of-concept of an HS/RS algorithm-confusion attack against a misconfigured
-`IssuerSigningKeyResolver`.
+authentication and request-pipeline trust boundaries. Built to **break
+assumptions and observe what the framework actually does** — including
+working proofs-of-concept of:
+
+- HS/RS algorithm-confusion attacks against a misconfigured `IssuerSigningKeyResolver`
+- Forwarded-header spoofing attacks against misconfigured reverse-proxy setups
+  (IP allowlist bypass, scheme spoofing, host spoofing)
 
 ## What this is
 
@@ -17,15 +20,52 @@ confusion, the relevant tests will go red.
 
 ## Highlights
 
+The lab is split into two project pairs, one per attack surface.
+
+**`AuthLab.Api` + `AuthLab.Tests` — JWT / Cookie auth (29 tests)**
+
 | Test class | What it asserts |
 | --- | --- |
 | `JwtAuthTests` | Default-config token validation: missing token, wrong issuer/audience/key, expired, `nbf` future, `alg:none`, query-string token, case-insensitive `Bearer`, distinguishable error messages |
 | `CookieAuthTests` | Cookie scheme: redirect-on-missing, login flow, tampered ticket, cookie attributes (`HttpOnly`, `SameSite`), session rotation, intentional open-redirect, intentional CSRF gap |
 | `JwtAlgorithmConfusionTests` | RS256 default config rejects HS256 forgery using public-key bytes as HMAC secret. The same forged token validates against a deliberately broken `IssuerSigningKeyResolver` — demonstrating that the framework's defense is *typed-key resolution* and a sloppy resolver disables it |
 
-29 / 29 tests pass on .NET 10.0.102.
+**`Transport.Api` + `Transport.Tests` — Forwarded headers (8 tests)**
 
-## Key finding: HS/RS algorithm confusion
+| Test class | What it asserts |
+| --- | --- |
+| `ForwardedHeadersTests` | Default config refuses spoofed `X-Forwarded-*` headers from non-loopback sources, but honors them from loopback (the dev-time trap). The "TrustAll" anti-pattern (cleared `KnownProxies`/`KnownIPNetworks`) re-enables full spoofing of `RemoteIpAddress`, `Scheme`, `Host` — including bypassing an `IsLoopback`-based IP allowlist by spoofing `X-Forwarded-For: 127.0.0.1` |
+
+37 / 37 tests pass on .NET 10.0.102.
+
+## Key finding 2: Forwarded-header spoofing across config modes
+
+| Mode | `KnownProxies` / `KnownIPNetworks` | Source `8.8.8.8` + `XFF: 1.2.3.4` | Source `127.0.0.1` + `XFF: 1.2.3.4` |
+| --- | --- | --- | --- |
+| Default | `[::1]` / `[127.0.0.0/8]` | `RemoteIp = 8.8.8.8` (rejected) | `RemoteIp = 1.2.3.4` (honored) |
+| TrustAll | cleared, `ForwardLimit = null` | `RemoteIp = 1.2.3.4` (honored) | same |
+| Off | `ForwardedHeaders.None` | `RemoteIp = 8.8.8.8` (header ignored) | same |
+
+The dev-time trap: in tests and on a developer's machine the source is loopback,
+so `Default` mode happily applies forwarded headers. In production the source
+is the public internet, so the same `Default` mode silently does nothing. Devs
+"fix" this by clearing `KnownProxies`/`KnownIPNetworks` (the `TrustAll` row) —
+which then accepts headers from anyone.
+
+**Concrete exploit demonstrated:** with `TrustAll`, an attacker sending
+`X-Forwarded-For: 127.0.0.1` to `/internal-only` (which gates on
+`IPAddress.IsLoopback(remoteIp)`) gets through the allowlist as if they were
+on the loopback interface.
+
+**Fix in application code:**
+
+* Set `KnownProxies` or `KnownIPNetworks` to the actual proxy/CIDR in front
+  of your app — don't clear them.
+* Restrict `AllowedHosts` if you process `X-Forwarded-Host`.
+* If you use `Authority`-based discovery or any code that branches on
+  `Request.IsHttps`, keep the proxy list pinned.
+
+## Key finding 1: HS/RS algorithm confusion
 
 | Endpoint | Resolver | Forged HS256 (signed with public-key PEM bytes) |
 | --- | --- | --- |
@@ -88,6 +128,15 @@ auth-lab/
     JwtAuthTests.cs
     CookieAuthTests.cs
     JwtAlgorithmConfusionTests.cs
+  Transport.Api/
+    Program.cs              Minimal API: /whoami-network, /internal-only.
+                            Reads ForwardedHeaders:SimulateRemoteIp at
+                            request time so test fixtures can simulate
+                            non-loopback connection sources.
+  Transport.Tests/
+    Fixtures.cs             LoopbackDefault / PublicDefault / PublicTrustAll
+                            / PublicOff fixtures via PostConfigure.
+    ForwardedHeadersTests.cs
 ```
 
 ## Intentional vulnerabilities (do not deploy)
